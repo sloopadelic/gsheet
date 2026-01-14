@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCAN // CLOUD</title>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script src='https://unpkg.com/tesseract.js@v5/dist/tesseract.min.js'></script>
+    <style>
+        :root {
+            --primary: #00f0ff;
+            --accent: #ff003c;
+            --bg: #0d0d0d;
+            --panel: #1a1a1a;
+        }
+
+        body {
+            background: var(--bg);
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* TOP BAR */
+        .header-bar {
+            background: var(--panel);
+            padding: 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            border-bottom: 2px solid #333;
+            z-index: 20;
+        }
+        .tag-input {
+            background: #000;
+            border: 1px solid #444;
+            color: var(--primary);
+            font-size: 1.1rem;
+            font-weight: bold;
+            padding: 10px;
+            width: 100%;
+            text-transform: uppercase;
+            border-radius: 4px;
+            text-align: center;
+        }
+
+        /* MAIN SCANNER */
+        #scanner-container {
+            position: relative;
+            flex: 1;
+            background: #000;
+            overflow: hidden;
+        }
+        #reader, #reader video { width: 100%; height: 100%; object-fit: cover; }
+
+        /* HUD */
+        .hud-layer {
+            position: absolute; top: 0; left: 0; w: 100%; h: 100%;
+            width: 100vw; height: 100vh;
+            pointer-events: none;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+        }
+        
+        .target-box {
+            border: 2px solid rgba(255,255,255,0.3);
+            box-shadow: 0 0 0 100vmax rgba(0,0,0,0.7);
+            transition: 0.3s ease;
+        }
+        .target-box.barcode { width: 80%; height: 250px; border-color: var(--primary); }
+        .target-box.text { width: 90%; height: 80px; border-color: var(--accent); }
+        
+        /* Status Text floating above controls */
+        #status-pill {
+            margin-top: 20px;
+            background: #000;
+            border: 1px solid #333;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            opacity: 0.8;
+            min-height: 20px;
+        }
+
+        /* CONTROLS */
+        .controls {
+            background: var(--panel);
+            padding: 15px;
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 12px;
+            height: 80px;
+        }
+
+        .btn {
+            background: #2a2a2a;
+            border: none;
+            border-radius: 8px;
+            color: #ccc;
+            font-weight: 700;
+            font-size: 0.8rem;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+        }
+        .btn.active { color: var(--primary); background: #333; border: 1px solid var(--primary); }
+        .btn.active-img { color: var(--accent); border: 1px solid var(--accent); }
+
+        /* LOADING SPINNER */
+        .spinner {
+            width: 20px; height: 20px;
+            border: 3px solid #fff; border-top: 3px solid var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: inline-block; vertical-align: middle; margin-right: 5px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+    </style>
+</head>
+<body>
+
+    <div class="header-bar">
+        <div style="font-size:1.5rem;">🏷️</div>
+        <input type="text" class="tag-input" id="tag-val" value="PALLET-A" placeholder="SET TAG">
+    </div>
+
+    <div id="scanner-container">
+        <div id="reader"></div>
+        <div class="hud-layer">
+            <div id="target" class="target-box barcode"></div>
+            <div id="status-pill">READY</div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button class="btn" id="btn-torch">
+            <span>🔦</span> TORCH
+        </button>
+        <button class="btn active" id="btn-mode">
+            <span>🔁</span> BARCODE
+        </button>
+        <button class="btn" id="btn-img">
+            <span>📷</span> NO IMG
+        </button>
+    </div>
+
+    <!-- Hidden Process Canvas -->
+    <canvas id="hidden-cvs" style="display:none;"></canvas>
+
+    <script>
+        // ==========================================
+        // 🛠️ SETTINGS - FILL THESE IN 🛠️
+        // ==========================================
+        const GOOGLE_SCRIPT = "YOUR_GOOGLE_SCRIPT_URL"; 
+        const CLOUD_NAME = "YOUR_CLOUDINARY_CLOUD_NAME"; 
+        const UPLOAD_PRESET = "YOUR_UNSIGNED_PRESET_NAME"; 
+        // ==========================================
+
+        const CLOUDINARY_API = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`;
+        const WHITELIST = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-';
+
+        // State
+        let html5QrCode;
+        let worker; // OCR
+        let mode = "BARCODE";
+        let useImg = false;
+        let isBusy = false;
+        let animationId;
+
+        // Init
+        window.onload = async () => {
+            initCam();
+            initOCR();
+            
+            // UI Binds
+            document.getElementById('btn-torch').onclick = toggleTorch;
+            document.getElementById('btn-mode').onclick = toggleMode;
+            document.getElementById('btn-img').onclick = toggleImg;
+        }
+
+        function initCam() {
+            html5QrCode = new Html5Qrcode("reader");
+            html5QrCode.start(
+                { facingMode: "environment" },
+                { fps: 15, qrbox: {width: 300, height: 250}, aspectRatio: 1.0 },
+                (txt) => processScan(txt, "BARCODE"),
+                () => {}
+            );
+        }
+
+        async function initOCR() {
+            worker = await Tesseract.createWorker("eng", 1, { logger: m => {} });
+            await worker.setParameters({ tessedit_char_whitelist: WHITELIST });
+        }
+
+        // ==========================================
+        // 🚀 CORE LOGIC
+        // ==========================================
+
+        async function processScan(code, type) {
+            if(isBusy) return;
+            // Prevent duplicate spam
+            const status = document.getElementById('status-pill');
+            if(status.innerText.includes(code)) return;
+
+            isBusy = true;
+            playBeep();
+
+            // 1. UI Update
+            const aim = document.getElementById('target');
+            aim.style.borderColor = "#32CD32"; // Green flash
+            status.innerHTML = `<div class="spinner"></div> UPLOADING...`;
+
+            // 2. Prepare Data
+            const tag = document.getElementById('tag-val').value;
+            let imgUrl = "";
+
+            try {
+                // 3. (Optional) Upload Image to Cloudinary
+                if(useImg) {
+                    const snap = takeSnapshot();
+                    imgUrl = await uploadToCloudinary(snap);
+                }
+
+                // 4. Send to Google Sheets
+                await fetch(GOOGLE_SCRIPT, {
+                    method: "POST",
+                    mode: "no-cors",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        code: code,
+                        type: type,
+                        tag: tag,
+                        imageUrl: imgUrl
+                    })
+                });
+
+                status.innerText = `${code} [SAVED]`;
+                status.style.color = "#32CD32";
+
+            } catch(e) {
+                console.error(e);
+                status.innerText = "ERROR";
+                status.style.color = "red";
+            }
+
+            // Reset
+            setTimeout(() => {
+                isBusy = false;
+                aim.style.borderColor = ""; // Reset border
+                status.style.color = "#fff";
+                if(!status.innerText.includes("ERROR")) status.innerText = "READY";
+            }, 1000); // 1 second cooldown
+        }
+
+        // ==========================================
+        // ☁️ CLOUD HELPERS
+        // ==========================================
+
+        function takeSnapshot() {
+            const vid = document.querySelector("#reader video");
+            const cvs = document.createElement("canvas");
+            // Scale down to 640px width - good balance for sheets
+            const scale = 640 / vid.videoWidth;
+            cvs.width = 640;
+            cvs.height = vid.videoHeight * scale;
+            cvs.getContext("2d").drawImage(vid, 0, 0, cvs.width, cvs.height);
+            return cvs.toDataURL("image/jpeg", 0.7);
+        }
+
+        async function uploadToCloudinary(base64Data) {
+            const formData = new FormData();
+            formData.append('file', base64Data);
+            formData.append('upload_preset', UPLOAD_PRESET);
+
+            const res = await fetch(CLOUDINARY_API, {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+            return data.secure_url; 
+        }
+
+        // ==========================================
+        // 🔡 OCR LOOP
+        // ==========================================
+        
+        async function ocrLoop() {
+            if(mode !== "TEXT") return;
+            if(!isBusy && worker) {
+                const vid = document.querySelector("#reader video");
+                if(vid) {
+                    const cvs = document.getElementById('hidden-cvs');
+                    const ctx = cvs.getContext('2d');
+                    
+                    // Optimization: Only scan center strip
+                    const w = 600;
+                    const scale = w / vid.videoWidth;
+                    cvs.width = w; cvs.height = 100;
+                    
+                    // Crop calculation
+                    const srcY = (vid.videoHeight - (100/scale)) / 2;
+                    
+                    ctx.drawImage(vid, 
+                        0, srcY, vid.videoWidth, 100/scale, // Source
+                        0, 0, w, 100 // Dest
+                    );
+                    
+                    const { data: { text } } = await worker.recognize(cvs);
+                    const clean = text.trim().replace(/\s/g, "");
+                    if(clean.length > 4) processScan(clean, "TEXT");
+                }
+            }
+            animationId = requestAnimationFrame(ocrLoop);
+        }
+
+        // ==========================================
+        // 🎮 CONTROLS
+        // ==========================================
+
+        function toggleMode() {
+            mode = mode === "BARCODE" ? "TEXT" : "BARCODE";
+            const btn = document.getElementById('btn-mode');
+            const target = document.getElementById('target');
+            
+            if(mode === "TEXT") {
+                btn.innerHTML = `<span>📝</span> TEXT`;
+                target.className = "target-box text";
+                ocrLoop();
+            } else {
+                btn.innerHTML = `<span>🔁</span> BARCODE`;
+                target.className = "target-box barcode";
+                cancelAnimationFrame(animationId);
+            }
+        }
+
+        function toggleImg() {
+            useImg = !useImg;
+            const btn = document.getElementById('btn-img');
+            if(useImg) {
+                btn.innerHTML = `<span>📸</span> WITH IMG`;
+                btn.className = "btn active-img";
+            } else {
+                btn.innerHTML = `<span>📷</span> NO IMG`;
+                btn.className = "btn";
+            }
+        }
+
+        function toggleTorch() {
+             html5QrCode.applyVideoConstraints({
+                advanced: [{torch: true}]
+            }).catch(e => console.log("Torch Error"));
+        }
+
+        function playBeep() {
+            const a = new (window.AudioContext || window.webkitAudioContext)();
+            const o = a.createOscillator();
+            const g = a.createGain();
+            o.connect(g); g.connect(a.destination);
+            o.frequency.value = 1200; g.gain.value=0.1;
+            o.start(); o.stop(a.currentTime+0.1);
+        }
+
+    </script>
+</body>
+</html>
